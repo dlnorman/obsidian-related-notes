@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+main.js
+main.js
+*.js.map
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plugin development
+data.json
+
+# Test files
+test_plugin.ts.off

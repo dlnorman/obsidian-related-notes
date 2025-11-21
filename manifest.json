@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-related-notes",
+	"name": "Related Notes (AI)",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Finds related notes using local AI embeddings.",
+	"author": "Antigravity",
+	"authorUrl": "https://github.com/google-deepmind",
+	"isDesktopOnly": true
+}
