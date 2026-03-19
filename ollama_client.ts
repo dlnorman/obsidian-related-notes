@@ -163,6 +163,19 @@ export class OllamaClient {
         }
     }
 
+    async listModels(): Promise<string[]> {
+        try {
+            const url = `${this.config.baseUrl}/api/tags`;
+            const response = await requestUrl({ url, method: 'GET' });
+            if (response.status !== 200) return [];
+            const data = response.json as { models?: { name: string }[] };
+            return (data.models ?? []).map(m => m.name);
+        } catch (error) {
+            console.error('Failed to list Ollama models:', error);
+            return [];
+        }
+    }
+
     private sanitizeText(text: string): string {
         // Remove null bytes and other control characters (except newlines and tabs)
         // This regex keeps printable ASCII, common accented characters, and standard whitespace

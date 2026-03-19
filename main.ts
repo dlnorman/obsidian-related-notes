@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, WorkspaceLeaf, TFile, Notice } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, WorkspaceLeaf, TFile, Notice, DropdownComponent } from 'obsidian';
 import { RelatedNotesView, VIEW_TYPE_RELATED_NOTES } from './view';
 import { SemanticSearchService } from './semantic_search';
 import { OllamaConfig } from './ollama_client';
@@ -87,8 +87,8 @@ export default class RelatedNotesPlugin extends Plugin {
 
         this.registerEvent(
             this.app.workspace.on('active-leaf-change', async () => {
-                const view = this.app.workspace.getLeavesOfType(VIEW_TYPE_RELATED_NOTES)[0]?.view as RelatedNotesView;
-                if (view) {
+                const view = this.app.workspace.getLeavesOfType(VIEW_TYPE_RELATED_NOTES)[0]?.view;
+                if (view instanceof RelatedNotesView) {
                     await view.update();
                 }
             })
@@ -131,6 +131,18 @@ export default class RelatedNotesPlugin extends Plugin {
     }
 }
 
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function buildProgressText(count: number, total: number, throughput: number): string {
+    const throughputStr = throughput > 0 ? ` — ${throughput.toLocaleString()} tok/s (est.)` : '';
+    return `Indexing: ${count} / ${total}${throughputStr}`;
+}
+
 class RelatedNotesSettingTab extends PluginSettingTab {
     plugin: RelatedNotesPlugin;
 
@@ -164,6 +176,11 @@ class RelatedNotesSettingTab extends PluginSettingTab {
         statsContainer.createEl('p', { text: `Indexed Notes: ${indexedFiles} / ${totalFiles}`, cls: 'index-stats-indexed-count' });
         statsContainer.createEl('p', { text: `Missing from Index: ${missingFiles}` });
         statsContainer.createEl('p', { text: `Last Indexed: ${lastIndexed}` });
+
+        const dbSizeEl = statsContainer.createEl('p', { text: 'Index Size: ...' });
+        this.plugin.searchService.getDatabaseSize().then(size => {
+            dbSizeEl.textContent = size !== null ? `Index Size: ${formatBytes(size)}` : 'Index Size: No index file';
+        });
 
         // Controls
         const buttonContainer = containerEl.createDiv({ cls: 'settings-button-container' });
@@ -221,14 +238,15 @@ class RelatedNotesSettingTab extends PluginSettingTab {
             progressText.style.textAlign = 'center';
             progressText.style.fontSize = '0.8em';
             progressText.style.marginTop = '5px';
-            progressText.textContent = `Indexing: ${this.plugin.searchService.currentProgress} / ${this.plugin.searchService.totalFiles}`;
+            const currentThroughput = this.plugin.searchService.currentThroughput;
+            progressText.textContent = buildProgressText(this.plugin.searchService.currentProgress, this.plugin.searchService.totalFiles, currentThroughput);
 
             // Subscribe to updates
-            this.plugin.searchService.onIndexingProgress = (count, total) => {
+            this.plugin.searchService.onIndexingProgress = (count, total, throughput) => {
                 requestAnimationFrame(() => {
                     progressBar.value = count;
                     progressBar.max = total;
-                    progressText.textContent = `Indexing: ${count} / ${total}`;
+                    progressText.textContent = buildProgressText(count, total, throughput);
 
                     // Also update stats if they exist
                     const statsEl = containerEl.querySelector('.index-stats-indexed-count');
@@ -263,16 +281,41 @@ class RelatedNotesSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
+        let modelDropdown: DropdownComponent | null = null;
+        const modelSetting = new Setting(containerEl)
             .setName('Embedding Model')
-            .setDesc('The Ollama model to use for generating embeddings (e.g. nomic-embed-text)')
-            .addText(text => text
-                .setPlaceholder('nomic-embed-text')
-                .setValue(this.plugin.settings.ollamaModel)
-                .onChange(async (value) => {
+            .setDesc('Fetching available models from Ollama...')
+            .addDropdown(dropdown => {
+                modelDropdown = dropdown;
+                dropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
+                dropdown.setValue(this.plugin.settings.ollamaModel);
+                dropdown.onChange(async (value) => {
                     this.plugin.settings.ollamaModel = value;
                     await this.plugin.saveSettings();
-                }));
+                });
+            });
+
+        this.plugin.searchService.listModels().then(models => {
+            if (!modelDropdown) return;
+            const selectEl = modelDropdown.selectEl;
+            while (selectEl.firstChild) selectEl.removeChild(selectEl.firstChild);
+            if (models.length === 0) {
+                modelSetting.setDesc('No models found — make sure Ollama is running at the configured URL.');
+                modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
+            } else {
+                modelSetting.setDesc('Select the Ollama model to use for generating embeddings.');
+                models.forEach(m => modelDropdown!.addOption(m, m));
+                if (!models.includes(this.plugin.settings.ollamaModel)) {
+                    modelDropdown.addOption(this.plugin.settings.ollamaModel, `${this.plugin.settings.ollamaModel} (current)`);
+                }
+            }
+            modelDropdown.setValue(this.plugin.settings.ollamaModel);
+        }).catch(() => {
+            if (!modelDropdown) return;
+            modelSetting.setDesc('Could not fetch models — check the Ollama URL above.');
+            modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
+            modelDropdown.setValue(this.plugin.settings.ollamaModel);
+        });
 
         new Setting(containerEl)
             .setName('Vector Storage Format')

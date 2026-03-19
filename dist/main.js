@@ -258,6 +258,19 @@ var OllamaClient = class {
       return false;
     }
   }
+  async listModels() {
+    try {
+      const url = `${this.config.baseUrl}/api/tags`;
+      const response = await (0, import_obsidian2.requestUrl)({ url, method: "GET" });
+      if (response.status !== 200)
+        return [];
+      const data = response.json;
+      return (data.models ?? []).map((m) => m.name);
+    } catch (error) {
+      console.error("Failed to list Ollama models:", error);
+      return [];
+    }
+  }
   sanitizeText(text) {
     return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   }
@@ -272,6 +285,9 @@ var SemanticSearchService = class {
     this.isIndexing = false;
     this.currentProgress = 0;
     this.totalFiles = 0;
+    this.currentThroughput = 0;
+    // estimated tokens/sec
+    this.indexingStartTime = 0;
     this.onIndexingProgress = null;
     this.abortController = null;
     this.vault = vault;
@@ -431,6 +447,22 @@ var SemanticSearchService = class {
   async generateEmbedding(text, title) {
     return await this.ollamaClient.generateEmbedding(text, title);
   }
+  async getDatabaseSize() {
+    const paths = [this.vectorStorePathBinary, this.vectorStorePathJson];
+    for (const p of paths) {
+      try {
+        if (await this.vault.adapter.exists(p)) {
+          const stat = await this.vault.adapter.stat(p);
+          return stat?.size ?? null;
+        }
+      } catch {
+      }
+    }
+    return null;
+  }
+  async listModels() {
+    return await this.ollamaClient.listModels();
+  }
   preprocessContent(content) {
     let clean = content.replace(/```dataview[\s\S]*?```/g, "");
     clean = clean.replace(/```dataviewjs[\s\S]*?```/g, "");
@@ -490,7 +522,10 @@ var SemanticSearchService = class {
     let changed = false;
     let successCount = 0;
     let errorCount = 0;
+    let bytesProcessed = 0;
     const failedFiles = [];
+    this.indexingStartTime = Date.now();
+    this.currentThroughput = 0;
     try {
       let processedCount = 0;
       this.totalFiles = files.length;
@@ -498,7 +533,7 @@ var SemanticSearchService = class {
         processedCount++;
         this.currentProgress = processedCount;
         if (this.onIndexingProgress)
-          this.onIndexingProgress(processedCount, files.length);
+          this.onIndexingProgress(processedCount, files.length, this.currentThroughput);
         if (processedCount % 5 === 0) {
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
@@ -510,8 +545,13 @@ var SemanticSearchService = class {
           console.log(`Indexing ${file.path}...`);
           try {
             await this.indexNote(file);
+            bytesProcessed += file.stat.size;
+            const elapsedSec = (Date.now() - this.indexingStartTime) / 1e3;
+            this.currentThroughput = elapsedSec > 0 ? Math.round(bytesProcessed / 4 / elapsedSec) : 0;
             changed = true;
             successCount++;
+            if (this.onIndexingProgress)
+              this.onIndexingProgress(processedCount, files.length, this.currentThroughput);
             if (successCount % 10 === 0) {
               await this.saveVectors();
             }
@@ -650,7 +690,7 @@ var RelatedNotesPlugin = class extends import_obsidian4.Plugin {
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", async () => {
         const view = this.app.workspace.getLeavesOfType(VIEW_TYPE_RELATED_NOTES)[0]?.view;
-        if (view) {
+        if (view instanceof RelatedNotesView) {
           await view.update();
         }
       })
@@ -681,6 +721,19 @@ var RelatedNotesPlugin = class extends import_obsidian4.Plugin {
     }
   }
 };
+function formatBytes(bytes) {
+  if (bytes < 1024)
+    return `${bytes} B`;
+  if (bytes < 1024 * 1024)
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+function buildProgressText(count, total, throughput) {
+  const throughputStr = throughput > 0 ? ` \u2014 ${throughput.toLocaleString()} tok/s (est.)` : "";
+  return `Indexing: ${count} / ${total}${throughputStr}`;
+}
 var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -701,6 +754,10 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
     statsContainer.createEl("p", { text: `Indexed Notes: ${indexedFiles} / ${totalFiles}`, cls: "index-stats-indexed-count" });
     statsContainer.createEl("p", { text: `Missing from Index: ${missingFiles}` });
     statsContainer.createEl("p", { text: `Last Indexed: ${lastIndexed}` });
+    const dbSizeEl = statsContainer.createEl("p", { text: "Index Size: ..." });
+    this.plugin.searchService.getDatabaseSize().then((size) => {
+      dbSizeEl.textContent = size !== null ? `Index Size: ${formatBytes(size)}` : "Index Size: No index file";
+    });
     const buttonContainer = containerEl.createDiv({ cls: "settings-button-container" });
     new import_obsidian4.Setting(containerEl).setName("Index All Notes").setDesc("Generate embeddings for all notes in the vault. This may take a while.").addButton((button) => {
       const updateButton = () => {
@@ -746,12 +803,13 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       progressText.style.textAlign = "center";
       progressText.style.fontSize = "0.8em";
       progressText.style.marginTop = "5px";
-      progressText.textContent = `Indexing: ${this.plugin.searchService.currentProgress} / ${this.plugin.searchService.totalFiles}`;
-      this.plugin.searchService.onIndexingProgress = (count, total) => {
+      const currentThroughput = this.plugin.searchService.currentThroughput;
+      progressText.textContent = buildProgressText(this.plugin.searchService.currentProgress, this.plugin.searchService.totalFiles, currentThroughput);
+      this.plugin.searchService.onIndexingProgress = (count, total, throughput) => {
         requestAnimationFrame(() => {
           progressBar.value = count;
           progressBar.max = total;
-          progressText.textContent = `Indexing: ${count} / ${total}`;
+          progressText.textContent = buildProgressText(count, total, throughput);
           const statsEl = containerEl.querySelector(".index-stats-indexed-count");
           if (statsEl) {
             statsEl.textContent = `Indexed Notes: ${this.plugin.searchService.vectors.length} / ${total}`;
@@ -770,10 +828,40 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       this.plugin.settings.ollamaUrl = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian4.Setting(containerEl).setName("Embedding Model").setDesc("The Ollama model to use for generating embeddings (e.g. nomic-embed-text)").addText((text) => text.setPlaceholder("nomic-embed-text").setValue(this.plugin.settings.ollamaModel).onChange(async (value) => {
-      this.plugin.settings.ollamaModel = value;
-      await this.plugin.saveSettings();
-    }));
+    let modelDropdown = null;
+    const modelSetting = new import_obsidian4.Setting(containerEl).setName("Embedding Model").setDesc("Fetching available models from Ollama...").addDropdown((dropdown) => {
+      modelDropdown = dropdown;
+      dropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
+      dropdown.setValue(this.plugin.settings.ollamaModel);
+      dropdown.onChange(async (value) => {
+        this.plugin.settings.ollamaModel = value;
+        await this.plugin.saveSettings();
+      });
+    });
+    this.plugin.searchService.listModels().then((models) => {
+      if (!modelDropdown)
+        return;
+      const selectEl = modelDropdown.selectEl;
+      while (selectEl.firstChild)
+        selectEl.removeChild(selectEl.firstChild);
+      if (models.length === 0) {
+        modelSetting.setDesc("No models found \u2014 make sure Ollama is running at the configured URL.");
+        modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
+      } else {
+        modelSetting.setDesc("Select the Ollama model to use for generating embeddings.");
+        models.forEach((m) => modelDropdown.addOption(m, m));
+        if (!models.includes(this.plugin.settings.ollamaModel)) {
+          modelDropdown.addOption(this.plugin.settings.ollamaModel, `${this.plugin.settings.ollamaModel} (current)`);
+        }
+      }
+      modelDropdown.setValue(this.plugin.settings.ollamaModel);
+    }).catch(() => {
+      if (!modelDropdown)
+        return;
+      modelSetting.setDesc("Could not fetch models \u2014 check the Ollama URL above.");
+      modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
+      modelDropdown.setValue(this.plugin.settings.ollamaModel);
+    });
     new import_obsidian4.Setting(containerEl).setName("Vector Storage Format").setDesc("Format to use for storing vectors. Binary is faster and smaller, JSON is human-readable.").addDropdown((dropdown) => dropdown.addOption("json", "JSON (Legacy)").addOption("binary", "Binary (Recommended)").setValue(this.plugin.settings.vectorFormat).onChange(async (value) => {
       this.plugin.settings.vectorFormat = value;
       this.plugin.searchService.setFormat(value);

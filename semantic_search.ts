@@ -220,6 +220,25 @@ export class SemanticSearchService {
         return await this.ollamaClient.generateEmbedding(text, title);
     }
 
+    async getDatabaseSize(): Promise<number | null> {
+        const paths = [this.vectorStorePathBinary, this.vectorStorePathJson];
+        for (const p of paths) {
+            try {
+                if (await this.vault.adapter.exists(p)) {
+                    const stat = await this.vault.adapter.stat(p);
+                    return stat?.size ?? null;
+                }
+            } catch {
+                // ignore
+            }
+        }
+        return null;
+    }
+
+    async listModels(): Promise<string[]> {
+        return await this.ollamaClient.listModels();
+    }
+
     private preprocessContent(content: string): string {
         // Remove Dataview and DataviewJS blocks
         let clean = content.replace(/```dataview[\s\S]*?```/g, '');
@@ -275,7 +294,9 @@ export class SemanticSearchService {
     public isIndexing = false;
     public currentProgress = 0;
     public totalFiles = 0;
-    public onIndexingProgress: ((count: number, total: number) => void) | null = null;
+    public currentThroughput = 0; // estimated tokens/sec
+    public indexingStartTime = 0;
+    public onIndexingProgress: ((count: number, total: number, throughput: number) => void) | null = null;
     private abortController: AbortController | null = null;
 
     cancelIndexing() {
@@ -302,7 +323,10 @@ export class SemanticSearchService {
         let changed = false;
         let successCount = 0;
         let errorCount = 0;
+        let bytesProcessed = 0;
         const failedFiles: string[] = [];
+        this.indexingStartTime = Date.now();
+        this.currentThroughput = 0;
 
         try {
             let processedCount = 0;
@@ -312,7 +336,7 @@ export class SemanticSearchService {
                 processedCount++;
                 this.currentProgress = processedCount;
 
-                if (this.onIndexingProgress) this.onIndexingProgress(processedCount, files.length);
+                if (this.onIndexingProgress) this.onIndexingProgress(processedCount, files.length, this.currentThroughput);
 
                 // Yield to event loop every 5 files to allow UI updates
                 if (processedCount % 5 === 0) {
@@ -328,8 +352,12 @@ export class SemanticSearchService {
                     console.log(`Indexing ${file.path}...`);
                     try {
                         await this.indexNote(file);
+                        bytesProcessed += file.stat.size;
+                        const elapsedSec = (Date.now() - this.indexingStartTime) / 1000;
+                        this.currentThroughput = elapsedSec > 0 ? Math.round((bytesProcessed / 4) / elapsedSec) : 0;
                         changed = true;
                         successCount++;
+                        if (this.onIndexingProgress) this.onIndexingProgress(processedCount, files.length, this.currentThroughput);
 
                         // Save periodically (every 10 notes) to prevent data loss on crash
                         if (successCount % 10 === 0) {
