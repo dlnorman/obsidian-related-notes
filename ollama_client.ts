@@ -9,6 +9,13 @@ export interface OllamaConfig {
     model: string;
 }
 
+export interface ModelBenchmarkResult {
+    supported: boolean;
+    dimension: number;
+    msPerEmbed: number;
+    discriminationScore: number; // within-topic sim minus cross-topic sim; higher = better
+}
+
 export class OllamaClient {
     private config: OllamaConfig;
     private debugMode: boolean;
@@ -20,6 +27,10 @@ export class OllamaClient {
 
     setDebugMode(debugMode: boolean) {
         this.debugMode = debugMode;
+    }
+
+    updateModel(model: string) {
+        this.config.model = model;
     }
 
     async generateEmbedding(text: string, title?: string, retries: number = 3): Promise<number[]> {
@@ -152,6 +163,94 @@ export class OllamaClient {
         throw new Error('Failed to generate embedding after all retries');
     }
 
+    async benchmarkModel(model?: string): Promise<ModelBenchmarkResult> {
+        const targetModel = model ?? this.config.model;
+
+        // Five test sentences: two tech (A), two cooking (B), one finance (C)
+        // A well-discriminating model should cluster A together and B together,
+        // but keep A and B far apart.
+        const sentences = [
+            'Machine learning models use gradient descent to optimize neural networks.',
+            'Deep learning requires large datasets and significant computational resources.',
+            'The pasta was perfectly al dente with a rich homemade tomato sauce.',
+            'Sautéing garlic in olive oil creates a wonderful aromatic base for sauces.',
+            'The quarterly earnings report showed a 15% increase in revenue.',
+        ];
+
+        const embeddings: number[][] = [];
+        const start = Date.now();
+
+        for (const sentence of sentences) {
+            const url = `${this.config.baseUrl}/api/embeddings`;
+            try {
+                const response = await requestUrl({
+                    url,
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: targetModel, prompt: sentence }),
+                    throw: false,
+                });
+                if (response.status !== 200) {
+                    return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                }
+                const data = response.json as OllamaEmbeddingResponse;
+                if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
+                    return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                }
+                embeddings.push(data.embedding);
+            } catch {
+                return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+            }
+        }
+
+        const elapsed = Date.now() - start;
+        const msPerEmbed = elapsed / sentences.length;
+        const dimension = embeddings[0].length;
+
+        // cosine similarity helper
+        const cosineSim = (a: number[], b: number[]): number => {
+            let dot = 0, normA = 0, normB = 0;
+            for (let i = 0; i < a.length; i++) {
+                dot += a[i] * b[i];
+                normA += a[i] * a[i];
+                normB += b[i] * b[i];
+            }
+            const denom = Math.sqrt(normA) * Math.sqrt(normB);
+            return denom === 0 ? 0 : dot / denom;
+        };
+
+        // Within-topic similarity: (A0,A1) and (B0,B1)
+        const withinTopic = (cosineSim(embeddings[0], embeddings[1]) + cosineSim(embeddings[2], embeddings[3])) / 2;
+        // Cross-topic similarity: A vs B pairs
+        const crossTopic = (
+            cosineSim(embeddings[0], embeddings[2]) +
+            cosineSim(embeddings[0], embeddings[3]) +
+            cosineSim(embeddings[1], embeddings[2]) +
+            cosineSim(embeddings[1], embeddings[3])
+        ) / 4;
+
+        const discriminationScore = withinTopic - crossTopic;
+
+        return { dimension, msPerEmbed, discriminationScore, supported: true };
+    }
+
+    async testEmbeddingSupport(model?: string): Promise<boolean> {
+        try {
+            const response = await requestUrl({
+                url: `${this.config.baseUrl}/api/embeddings`,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: model ?? this.config.model, prompt: 'test' }),
+                throw: false,
+            });
+            if (response.status !== 200) return false;
+            const data = response.json as OllamaEmbeddingResponse;
+            return Array.isArray(data.embedding) && data.embedding.length > 0;
+        } catch {
+            return false;
+        }
+    }
+
     async testConnection(): Promise<boolean> {
         try {
             const url = `${this.config.baseUrl}/api/tags`;
@@ -168,8 +267,17 @@ export class OllamaClient {
             const url = `${this.config.baseUrl}/api/tags`;
             const response = await requestUrl({ url, method: 'GET' });
             if (response.status !== 200) return [];
-            const data = response.json as { models?: { name: string }[] };
-            return (data.models ?? []).map(m => m.name);
+            const data = response.json as { models?: { name: string; capabilities?: string[] }[] };
+            const models = data.models ?? [];
+            // If Ollama returns capability info, filter to embedding-capable models only.
+            // Fall back to all models if capabilities aren't present (older Ollama versions).
+            const hasCapabilityInfo = models.some(m => Array.isArray(m.capabilities));
+            if (hasCapabilityInfo) {
+                return models
+                    .filter(m => m.capabilities?.includes('embedding'))
+                    .map(m => m.name);
+            }
+            return models.map(m => m.name);
         } catch (error) {
             console.error('Failed to list Ollama models:', error);
             return [];

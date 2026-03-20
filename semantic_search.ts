@@ -3,12 +3,12 @@ import { OllamaClient, OllamaConfig } from './ollama_client';
 
 export interface NoteVector {
     path: string;
-    embedding: number[];
+    embedding: Float32Array;
     mtime: number;
 }
 
 export class SemanticSearchService {
-    private ollamaClient: OllamaClient;
+    public ollamaClient: OllamaClient;
     public vectors: NoteVector[] = [];
     private vault: Vault;
     private vectorStorePathJson = normalizePath('.obsidian/plugins/obsidian-related-notes/vectors.json');
@@ -32,6 +32,10 @@ export class SemanticSearchService {
         this.ollamaClient.setDebugMode(debugMode);
     }
 
+    updateModel(model: string) {
+        this.ollamaClient.updateModel(model);
+    }
+
     async testConnection(): Promise<boolean> {
         return await this.ollamaClient.testConnection();
     }
@@ -43,24 +47,31 @@ export class SemanticSearchService {
         if (this.format === 'binary') {
             if (await this.vault.adapter.exists(this.vectorStorePathBinary)) {
                 await this.loadVectorsBinary();
-                return;
-            }
-            // Fallback to JSON if binary doesn't exist yet
-            if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
+            } else if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
+                // Fallback to JSON if binary doesn't exist yet; convert to binary on next save
                 await this.loadVectorsJson();
-                // Convert to binary on next save
             }
         } else {
             if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
                 await this.loadVectorsJson();
             }
         }
+
+        // Prune vectors for notes that no longer exist, so they don't pollute search results
+        const currentPaths = new Set(this.vault.getMarkdownFiles().map(f => f.path));
+        const before = this.vectors.length;
+        this.vectors = this.vectors.filter(v => currentPaths.has(v.path));
+        const pruned = before - this.vectors.length;
+        if (pruned > 0) {
+            console.log(`Pruned ${pruned} stale vectors at load time`);
+        }
     }
 
     async loadVectorsJson() {
         try {
             const content = await this.vault.adapter.read(this.vectorStorePathJson);
-            this.vectors = JSON.parse(content);
+            const raw: { path: string; embedding: number[]; mtime: number }[] = JSON.parse(content);
+            this.vectors = raw.map(v => ({ path: v.path, embedding: new Float32Array(v.embedding), mtime: v.mtime }));
             console.log(`Loaded ${this.vectors.length} vectors from JSON`);
         } catch (error) {
             console.error('Failed to load JSON vectors:', error);
@@ -109,11 +120,7 @@ export class SemanticSearchService {
                     offset += 4;
                 }
 
-                this.vectors.push({
-                    path,
-                    mtime,
-                    embedding: Array.from(embedding) // Convert back to number[] for compatibility
-                });
+                this.vectors.push({ path, mtime, embedding });
             }
             console.log(`Loaded ${this.vectors.length} vectors from Binary`);
         } catch (error) {
@@ -141,7 +148,8 @@ export class SemanticSearchService {
     }
 
     async saveVectorsJson() {
-        const data = JSON.stringify(this.vectors, null, 2);
+        const serializable = this.vectors.map(v => ({ path: v.path, mtime: v.mtime, embedding: Array.from(v.embedding) }));
+        const data = JSON.stringify(serializable, null, 2);
         await this.vault.adapter.write(this.vectorStorePathJson, data);
         console.log(`Saved ${this.vectors.length} vectors to JSON`);
     }
@@ -264,28 +272,18 @@ export class SemanticSearchService {
 
         const content = await this.vault.read(file);
         const cleanedContent = this.preprocessContent(content);
-        const embedding = await this.generateEmbedding(cleanedContent, file.basename);
+        const rawEmbedding = await this.generateEmbedding(cleanedContent, file.basename);
+        const embedding = new Float32Array(rawEmbedding);
+        const entry: NoteVector = { path: file.path, embedding, mtime: file.stat.mtime };
         if (existingIndex >= 0) {
-            this.vectors[existingIndex] = {
-                path: file.path,
-                embedding: embedding,
-                mtime: file.stat.mtime
-            };
+            this.vectors[existingIndex] = entry;
         } else {
             // Double check to prevent race conditions
             const doubleCheckIndex = this.vectors.findIndex(v => v.path === file.path);
             if (doubleCheckIndex >= 0) {
-                this.vectors[doubleCheckIndex] = {
-                    path: file.path,
-                    embedding: embedding,
-                    mtime: file.stat.mtime
-                };
+                this.vectors[doubleCheckIndex] = entry;
             } else {
-                this.vectors.push({
-                    path: file.path,
-                    embedding: embedding,
-                    mtime: file.stat.mtime
-                });
+                this.vectors.push(entry);
             }
         }
     }
@@ -295,6 +293,7 @@ export class SemanticSearchService {
     public currentProgress = 0;
     public totalFiles = 0;
     public currentThroughput = 0; // estimated tokens/sec
+    public lastFailedFiles: { path: string; reason: string }[] = [];
     public indexingStartTime = 0;
     public onIndexingProgress: ((count: number, total: number, throughput: number) => void) | null = null;
     private abortController: AbortController | null = null;
@@ -324,9 +323,10 @@ export class SemanticSearchService {
         let successCount = 0;
         let errorCount = 0;
         let bytesProcessed = 0;
-        const failedFiles: string[] = [];
+        const failedFiles: { path: string; reason: string }[] = [];
         this.indexingStartTime = Date.now();
         this.currentThroughput = 0;
+        this.lastFailedFiles = [];
 
         try {
             let processedCount = 0;
@@ -365,10 +365,7 @@ export class SemanticSearchService {
                         }
                     } catch (error) {
                         console.error(`Failed to index ${file.path}:`, error.message);
-                        // Log the first 100 chars of the content to help debug
-                        const content = await this.vault.read(file);
-                        console.log(`Failed note content snippet: "${content.substring(0, 100)}..."`);
-                        failedFiles.push(file.path);
+                        failedFiles.push({ path: file.path, reason: error.message });
                         errorCount++;
                         // Continue with next file instead of stopping
                     }
@@ -394,6 +391,7 @@ export class SemanticSearchService {
                 await this.saveVectors();
             }
 
+            this.lastFailedFiles = failedFiles;
             if (this.debugMode) console.log(`Indexing complete: ${successCount} succeeded, ${errorCount} failed, ${prunedCount} pruned`);
             if (failedFiles.length > 0 && this.debugMode) {
                 console.log('Failed files:', failedFiles);
@@ -415,7 +413,7 @@ export class SemanticSearchService {
         }
     }
 
-    cosineSimilarity(a: number[], b: number[]) {
+    cosineSimilarity(a: Float32Array, b: Float32Array) {
         let dotProduct = 0;
         let normA = 0;
         let normB = 0;

@@ -125,6 +125,9 @@ var OllamaClient = class {
   setDebugMode(debugMode) {
     this.debugMode = debugMode;
   }
+  updateModel(model) {
+    this.config.model = model;
+  }
   async generateEmbedding(text, title, retries = 3) {
     const url = `${this.config.baseUrl}/api/embeddings`;
     const sanitizedText = this.sanitizeText(text);
@@ -248,6 +251,74 @@ var OllamaClient = class {
     }
     throw new Error("Failed to generate embedding after all retries");
   }
+  async benchmarkModel(model) {
+    const targetModel = model ?? this.config.model;
+    const sentences = [
+      "Machine learning models use gradient descent to optimize neural networks.",
+      "Deep learning requires large datasets and significant computational resources.",
+      "The pasta was perfectly al dente with a rich homemade tomato sauce.",
+      "Saut\xE9ing garlic in olive oil creates a wonderful aromatic base for sauces.",
+      "The quarterly earnings report showed a 15% increase in revenue."
+    ];
+    const embeddings = [];
+    const start = Date.now();
+    for (const sentence of sentences) {
+      const url = `${this.config.baseUrl}/api/embeddings`;
+      try {
+        const response = await (0, import_obsidian2.requestUrl)({
+          url,
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: targetModel, prompt: sentence }),
+          throw: false
+        });
+        if (response.status !== 200) {
+          return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+        }
+        const data = response.json;
+        if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
+          return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+        }
+        embeddings.push(data.embedding);
+      } catch {
+        return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+      }
+    }
+    const elapsed = Date.now() - start;
+    const msPerEmbed = elapsed / sentences.length;
+    const dimension = embeddings[0].length;
+    const cosineSim = (a, b) => {
+      let dot = 0, normA = 0, normB = 0;
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+      }
+      const denom = Math.sqrt(normA) * Math.sqrt(normB);
+      return denom === 0 ? 0 : dot / denom;
+    };
+    const withinTopic = (cosineSim(embeddings[0], embeddings[1]) + cosineSim(embeddings[2], embeddings[3])) / 2;
+    const crossTopic = (cosineSim(embeddings[0], embeddings[2]) + cosineSim(embeddings[0], embeddings[3]) + cosineSim(embeddings[1], embeddings[2]) + cosineSim(embeddings[1], embeddings[3])) / 4;
+    const discriminationScore = withinTopic - crossTopic;
+    return { dimension, msPerEmbed, discriminationScore, supported: true };
+  }
+  async testEmbeddingSupport(model) {
+    try {
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.config.baseUrl}/api/embeddings`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: model ?? this.config.model, prompt: "test" }),
+        throw: false
+      });
+      if (response.status !== 200)
+        return false;
+      const data = response.json;
+      return Array.isArray(data.embedding) && data.embedding.length > 0;
+    } catch {
+      return false;
+    }
+  }
   async testConnection() {
     try {
       const url = `${this.config.baseUrl}/api/tags`;
@@ -265,7 +336,12 @@ var OllamaClient = class {
       if (response.status !== 200)
         return [];
       const data = response.json;
-      return (data.models ?? []).map((m) => m.name);
+      const models = data.models ?? [];
+      const hasCapabilityInfo = models.some((m) => Array.isArray(m.capabilities));
+      if (hasCapabilityInfo) {
+        return models.filter((m) => m.capabilities?.includes("embedding")).map((m) => m.name);
+      }
+      return models.map((m) => m.name);
     } catch (error) {
       console.error("Failed to list Ollama models:", error);
       return [];
@@ -287,6 +363,7 @@ var SemanticSearchService = class {
     this.totalFiles = 0;
     this.currentThroughput = 0;
     // estimated tokens/sec
+    this.lastFailedFiles = [];
     this.indexingStartTime = 0;
     this.onIndexingProgress = null;
     this.abortController = null;
@@ -302,6 +379,9 @@ var SemanticSearchService = class {
     this.debugMode = debugMode;
     this.ollamaClient.setDebugMode(debugMode);
   }
+  updateModel(model) {
+    this.ollamaClient.updateModel(model);
+  }
   async testConnection() {
     return await this.ollamaClient.testConnection();
   }
@@ -310,9 +390,7 @@ var SemanticSearchService = class {
     if (this.format === "binary") {
       if (await this.vault.adapter.exists(this.vectorStorePathBinary)) {
         await this.loadVectorsBinary();
-        return;
-      }
-      if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
+      } else if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
         await this.loadVectorsJson();
       }
     } else {
@@ -320,11 +398,19 @@ var SemanticSearchService = class {
         await this.loadVectorsJson();
       }
     }
+    const currentPaths = new Set(this.vault.getMarkdownFiles().map((f) => f.path));
+    const before = this.vectors.length;
+    this.vectors = this.vectors.filter((v) => currentPaths.has(v.path));
+    const pruned = before - this.vectors.length;
+    if (pruned > 0) {
+      console.log(`Pruned ${pruned} stale vectors at load time`);
+    }
   }
   async loadVectorsJson() {
     try {
       const content = await this.vault.adapter.read(this.vectorStorePathJson);
-      this.vectors = JSON.parse(content);
+      const raw = JSON.parse(content);
+      this.vectors = raw.map((v) => ({ path: v.path, embedding: new Float32Array(v.embedding), mtime: v.mtime }));
       console.log(`Loaded ${this.vectors.length} vectors from JSON`);
     } catch (error) {
       console.error("Failed to load JSON vectors:", error);
@@ -359,12 +445,7 @@ var SemanticSearchService = class {
           embedding[j] = view.getFloat32(offset, true);
           offset += 4;
         }
-        this.vectors.push({
-          path,
-          mtime,
-          embedding: Array.from(embedding)
-          // Convert back to number[] for compatibility
-        });
+        this.vectors.push({ path, mtime, embedding });
       }
       console.log(`Loaded ${this.vectors.length} vectors from Binary`);
     } catch (error) {
@@ -389,7 +470,8 @@ var SemanticSearchService = class {
     }
   }
   async saveVectorsJson() {
-    const data = JSON.stringify(this.vectors, null, 2);
+    const serializable = this.vectors.map((v) => ({ path: v.path, mtime: v.mtime, embedding: Array.from(v.embedding) }));
+    const data = JSON.stringify(serializable, null, 2);
     await this.vault.adapter.write(this.vectorStorePathJson, data);
     console.log(`Saved ${this.vectors.length} vectors to JSON`);
   }
@@ -478,27 +560,17 @@ var SemanticSearchService = class {
     }
     const content = await this.vault.read(file);
     const cleanedContent = this.preprocessContent(content);
-    const embedding = await this.generateEmbedding(cleanedContent, file.basename);
+    const rawEmbedding = await this.generateEmbedding(cleanedContent, file.basename);
+    const embedding = new Float32Array(rawEmbedding);
+    const entry = { path: file.path, embedding, mtime: file.stat.mtime };
     if (existingIndex >= 0) {
-      this.vectors[existingIndex] = {
-        path: file.path,
-        embedding,
-        mtime: file.stat.mtime
-      };
+      this.vectors[existingIndex] = entry;
     } else {
       const doubleCheckIndex = this.vectors.findIndex((v) => v.path === file.path);
       if (doubleCheckIndex >= 0) {
-        this.vectors[doubleCheckIndex] = {
-          path: file.path,
-          embedding,
-          mtime: file.stat.mtime
-        };
+        this.vectors[doubleCheckIndex] = entry;
       } else {
-        this.vectors.push({
-          path: file.path,
-          embedding,
-          mtime: file.stat.mtime
-        });
+        this.vectors.push(entry);
       }
     }
   }
@@ -526,6 +598,7 @@ var SemanticSearchService = class {
     const failedFiles = [];
     this.indexingStartTime = Date.now();
     this.currentThroughput = 0;
+    this.lastFailedFiles = [];
     try {
       let processedCount = 0;
       this.totalFiles = files.length;
@@ -557,9 +630,7 @@ var SemanticSearchService = class {
             }
           } catch (error) {
             console.error(`Failed to index ${file.path}:`, error.message);
-            const content = await this.vault.read(file);
-            console.log(`Failed note content snippet: "${content.substring(0, 100)}..."`);
-            failedFiles.push(file.path);
+            failedFiles.push({ path: file.path, reason: error.message });
             errorCount++;
           }
         } else {
@@ -579,6 +650,7 @@ var SemanticSearchService = class {
         console.log(`Pruned ${prunedCount} deleted notes from index.`);
         await this.saveVectors();
       }
+      this.lastFailedFiles = failedFiles;
       if (this.debugMode)
         console.log(`Indexing complete: ${successCount} succeeded, ${errorCount} failed, ${prunedCount} pruned`);
       if (failedFiles.length > 0 && this.debugMode) {
@@ -667,6 +739,7 @@ var RelatedNotesPlugin = class extends import_obsidian4.Plugin {
         try {
           await this.searchService.indexAll(files);
           this.settings.lastIndexedDate = Date.now();
+          this.settings.lastIndexedModel = this.settings.ollamaModel;
           await this.saveSettings();
           new import_obsidian4.Notice("Indexing complete!");
         } catch (error) {
@@ -754,6 +827,24 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
     statsContainer.createEl("p", { text: `Indexed Notes: ${indexedFiles} / ${totalFiles}`, cls: "index-stats-indexed-count" });
     statsContainer.createEl("p", { text: `Missing from Index: ${missingFiles}` });
     statsContainer.createEl("p", { text: `Last Indexed: ${lastIndexed}` });
+    const indexedModel = this.plugin.settings.lastIndexedModel;
+    const currentModel = this.plugin.settings.ollamaModel;
+    if (indexedModel && indexedModel !== currentModel && indexedFiles > 0) {
+      const mismatchEl = statsContainer.createEl("p", {
+        text: `\u26A0\uFE0F Index was built with "${indexedModel}" but current model is "${currentModel}". Results will be meaningless until you re-index.`,
+        attr: { style: "color: var(--text-error); font-weight: 500;" }
+      });
+    }
+    const failedFiles = this.plugin.searchService.lastFailedFiles;
+    if (failedFiles.length > 0) {
+      statsContainer.createEl("p", { text: `Failed to index (${failedFiles.length}):`, attr: { style: "color: var(--text-error); margin-bottom: 2px;" } });
+      const failedList = statsContainer.createEl("ul", { attr: { style: "margin: 0 0 8px 1.2em; font-size: 0.85em;" } });
+      for (const { path, reason } of failedFiles) {
+        const item = failedList.createEl("li");
+        item.createEl("span", { text: path });
+        item.createEl("span", { text: ` \u2014 ${reason}`, attr: { style: "color: var(--text-muted);" } });
+      }
+    }
     const dbSizeEl = statsContainer.createEl("p", { text: "Index Size: ..." });
     this.plugin.searchService.getDatabaseSize().then((size) => {
       dbSizeEl.textContent = size !== null ? `Index Size: ${formatBytes(size)}` : "Index Size: No index file";
@@ -777,8 +868,10 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
           const files = this.app.vault.getMarkdownFiles();
           this.plugin.searchService.indexAll(files).then(async () => {
             this.plugin.settings.lastIndexedDate = Date.now();
+            this.plugin.settings.lastIndexedModel = this.plugin.settings.ollamaModel;
             await this.plugin.saveSettings();
-            new import_obsidian4.Notice("Indexing complete!");
+            const failed = this.plugin.searchService.lastFailedFiles.length;
+            new import_obsidian4.Notice(failed > 0 ? `Indexing complete (${failed} file${failed === 1 ? "" : "s"} failed \u2014 see stats panel)` : "Indexing complete!");
             this.display();
           }).catch((err) => {
             if (err.message !== "Indexing cancelled") {
@@ -806,15 +899,13 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       const currentThroughput = this.plugin.searchService.currentThroughput;
       progressText.textContent = buildProgressText(this.plugin.searchService.currentProgress, this.plugin.searchService.totalFiles, currentThroughput);
       this.plugin.searchService.onIndexingProgress = (count, total, throughput) => {
-        requestAnimationFrame(() => {
-          progressBar.value = count;
-          progressBar.max = total;
-          progressText.textContent = buildProgressText(count, total, throughput);
-          const statsEl = containerEl.querySelector(".index-stats-indexed-count");
-          if (statsEl) {
-            statsEl.textContent = `Indexed Notes: ${this.plugin.searchService.vectors.length} / ${total}`;
-          }
-        });
+        progressBar.value = count;
+        progressBar.max = total;
+        progressText.textContent = buildProgressText(count, total, throughput);
+        const statsEl = containerEl.querySelector(".index-stats-indexed-count");
+        if (statsEl) {
+          statsEl.textContent = `Indexed Notes: ${this.plugin.searchService.vectors.length} / ${total}`;
+        }
       };
     } else {
       this.plugin.searchService.onIndexingProgress = null;
@@ -828,6 +919,52 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       this.plugin.settings.ollamaUrl = value;
       await this.plugin.saveSettings();
     }));
+    const benchmarkPanel = containerEl.createDiv({ cls: "model-benchmark-panel" });
+    benchmarkPanel.style.cssText = "margin: 4px 0 16px 0; padding: 10px 12px; background: var(--background-secondary); border-radius: 6px; font-size: 0.85em; display: none;";
+    const renderBenchmark = (result, loading) => {
+      benchmarkPanel.empty();
+      benchmarkPanel.style.display = "block";
+      if (loading) {
+        benchmarkPanel.createEl("span", { text: "Analyzing model\u2026", attr: { style: "color: var(--text-muted);" } });
+        return;
+      }
+      if (!result || !result.supported) {
+        benchmarkPanel.createEl("span", { text: "\u26A0\uFE0F This model does not support embeddings.", attr: { style: "color: var(--text-error);" } });
+        return;
+      }
+      const score = result.discriminationScore;
+      let quality, qualityColor;
+      if (score >= 0.28) {
+        quality = "Excellent";
+        qualityColor = "var(--color-green)";
+      } else if (score >= 0.18) {
+        quality = "Good";
+        qualityColor = "var(--color-green)";
+      } else if (score >= 0.07) {
+        quality = "Fair";
+        qualityColor = "var(--text-warning, orange)";
+      } else {
+        quality = "Poor";
+        qualityColor = "var(--text-error)";
+      }
+      const speedLabel = result.msPerEmbed < 300 ? "Fast" : result.msPerEmbed < 1e3 ? "Moderate" : "Slow";
+      const grid = benchmarkPanel.createDiv({ attr: { style: "display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; align-items: baseline;" } });
+      const add = (label, value, color) => {
+        grid.createEl("span", { text: label, attr: { style: "color: var(--text-muted);" } });
+        grid.createEl("span", { text: value, attr: { style: color ? `color: ${color}; font-weight: 500;` : "" } });
+      };
+      add("Embedding size:", `${result.dimension.toLocaleString()} dimensions`);
+      add("Speed:", `${speedLabel} (~${Math.round(result.msPerEmbed)}ms/note)`);
+      add("Relatedness quality:", `${quality} (score: ${score.toFixed(3)})`, qualityColor);
+      const hint = benchmarkPanel.createEl("p", { attr: { style: "margin: 6px 0 0; color: var(--text-muted); font-style: italic;" } });
+      if (score < 0.07) {
+        hint.textContent = "This model may struggle to distinguish related notes from unrelated ones. Try a different embedding model.";
+      } else if (score < 0.18) {
+        hint.textContent = "Decent results expected, though a higher-dimensional model may improve accuracy.";
+      } else {
+        hint.textContent = "This model should find meaningful connections between your notes.";
+      }
+    };
     let modelDropdown = null;
     const modelSetting = new import_obsidian4.Setting(containerEl).setName("Embedding Model").setDesc("Fetching available models from Ollama...").addDropdown((dropdown) => {
       modelDropdown = dropdown;
@@ -835,30 +972,47 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       dropdown.setValue(this.plugin.settings.ollamaModel);
       dropdown.onChange(async (value) => {
         this.plugin.settings.ollamaModel = value;
+        this.plugin.searchService.updateModel(value);
         await this.plugin.saveSettings();
+        modelSetting.setDesc("Analyzing model\u2026");
+        renderBenchmark(null, true);
+        const result = await this.plugin.searchService.ollamaClient.benchmarkModel(value);
+        renderBenchmark(result, false);
+        const indexedModel2 = this.plugin.settings.lastIndexedModel;
+        const hasIndex = this.plugin.searchService.vectors.length > 0;
+        if (result.supported && hasIndex && indexedModel2 && indexedModel2 !== value) {
+          modelSetting.setDesc(`\u26A0\uFE0F Existing index was built with "${indexedModel2}" \u2014 you must re-index before results will be valid.`);
+        } else {
+          modelSetting.setDesc(result.supported ? "Model supports embeddings. \u2713" : "\u26A0\uFE0F Not an embedding model.");
+        }
       });
     });
-    this.plugin.searchService.listModels().then((models) => {
+    modelSetting.settingEl.insertAdjacentElement("afterend", benchmarkPanel);
+    this.plugin.searchService.listModels().then(async (models) => {
       if (!modelDropdown)
         return;
       const selectEl = modelDropdown.selectEl;
       while (selectEl.firstChild)
         selectEl.removeChild(selectEl.firstChild);
       if (models.length === 0) {
-        modelSetting.setDesc("No models found \u2014 make sure Ollama is running at the configured URL.");
         modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
       } else {
-        modelSetting.setDesc("Select the Ollama model to use for generating embeddings.");
         models.forEach((m) => modelDropdown.addOption(m, m));
         if (!models.includes(this.plugin.settings.ollamaModel)) {
           modelDropdown.addOption(this.plugin.settings.ollamaModel, `${this.plugin.settings.ollamaModel} (current)`);
         }
       }
       modelDropdown.setValue(this.plugin.settings.ollamaModel);
+      modelSetting.setDesc("Analyzing model\u2026");
+      renderBenchmark(null, true);
+      const result = await this.plugin.searchService.ollamaClient.benchmarkModel();
+      renderBenchmark(result, false);
+      modelSetting.setDesc(result.supported ? "Model supports embeddings. \u2713" : models.length === 0 ? "No models found \u2014 make sure Ollama is running at the configured URL." : "\u26A0\uFE0F This model does not support embeddings. Choose an embedding model (e.g. nomic-embed-text).");
     }).catch(() => {
       if (!modelDropdown)
         return;
       modelSetting.setDesc("Could not fetch models \u2014 check the Ollama URL above.");
+      benchmarkPanel.style.display = "none";
       modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
       modelDropdown.setValue(this.plugin.settings.ollamaModel);
     });
