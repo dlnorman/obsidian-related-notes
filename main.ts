@@ -157,6 +157,14 @@ class RelatedNotesSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
+        // If vectors are still loading, re-render once they're ready
+        if (!this.plugin.searchService.isVectorsLoaded) {
+            this.plugin.searchService.onVectorsLoaded = () => {
+                this.plugin.searchService.onVectorsLoaded = null;
+                this.display();
+            };
+        }
+
         // Index Statistics Section
         containerEl.createEl('h2', { text: 'Index Statistics' });
 
@@ -176,7 +184,7 @@ class RelatedNotesSettingTab extends PluginSettingTab {
         // Display stats
         statsContainer.createEl('p', { text: `Status: ${status}` });
         statsContainer.createEl('p', { text: `Indexed Notes: ${indexedFiles} / ${totalFiles}`, cls: 'index-stats-indexed-count' });
-        statsContainer.createEl('p', { text: `Missing from Index: ${missingFiles}` });
+        statsContainer.createEl('p', { text: `Missing from Index: ${missingFiles}`, cls: 'index-stats-missing-count' });
         statsContainer.createEl('p', { text: `Last Indexed: ${lastIndexed}` });
 
         const indexedModel = this.plugin.settings.lastIndexedModel;
@@ -274,7 +282,11 @@ class RelatedNotesSettingTab extends PluginSettingTab {
                 // Also update stats if they exist
                 const statsEl = containerEl.querySelector('.index-stats-indexed-count');
                 if (statsEl) {
-                    statsEl.textContent = `Indexed Notes: ${this.plugin.searchService.vectors.length} / ${total}`;
+                    statsEl.textContent = `Indexed Notes: ${count} / ${total}`;
+                }
+                const missingEl = containerEl.querySelector('.index-stats-missing-count');
+                if (missingEl) {
+                    missingEl.textContent = `Missing from Index: ${total - count}`;
                 }
             };
         } else {

@@ -356,6 +356,8 @@ var OllamaClient = class {
 var SemanticSearchService = class {
   constructor(vault, ollamaConfig, format = "json", debugMode = false) {
     this.vectors = [];
+    this.isVectorsLoaded = false;
+    this.onVectorsLoaded = null;
     this.vectorStorePathJson = (0, import_obsidian3.normalizePath)(".obsidian/plugins/obsidian-related-notes/vectors.json");
     this.vectorStorePathBinary = (0, import_obsidian3.normalizePath)(".obsidian/plugins/obsidian-related-notes/vectors.bin");
     this.isIndexing = false;
@@ -396,6 +398,8 @@ var SemanticSearchService = class {
     } else {
       if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
         await this.loadVectorsJson();
+      } else if (await this.vault.adapter.exists(this.vectorStorePathBinary)) {
+        await this.loadVectorsBinary();
       }
     }
     const currentPaths = new Set(this.vault.getMarkdownFiles().map((f) => f.path));
@@ -405,6 +409,9 @@ var SemanticSearchService = class {
     if (pruned > 0) {
       console.log(`Pruned ${pruned} stale vectors at load time`);
     }
+    this.isVectorsLoaded = true;
+    if (this.onVectorsLoaded)
+      this.onVectorsLoaded();
   }
   async loadVectorsJson() {
     try {
@@ -815,6 +822,12 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    if (!this.plugin.searchService.isVectorsLoaded) {
+      this.plugin.searchService.onVectorsLoaded = () => {
+        this.plugin.searchService.onVectorsLoaded = null;
+        this.display();
+      };
+    }
     containerEl.createEl("h2", { text: "Index Statistics" });
     const statsContainer = containerEl.createDiv({ cls: "index-stats-container" });
     const totalFiles = this.plugin.app.vault.getMarkdownFiles().length;
@@ -825,7 +838,7 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
     const status = this.plugin.searchService.isIndexing ? "Indexing..." : "Idle";
     statsContainer.createEl("p", { text: `Status: ${status}` });
     statsContainer.createEl("p", { text: `Indexed Notes: ${indexedFiles} / ${totalFiles}`, cls: "index-stats-indexed-count" });
-    statsContainer.createEl("p", { text: `Missing from Index: ${missingFiles}` });
+    statsContainer.createEl("p", { text: `Missing from Index: ${missingFiles}`, cls: "index-stats-missing-count" });
     statsContainer.createEl("p", { text: `Last Indexed: ${lastIndexed}` });
     const indexedModel = this.plugin.settings.lastIndexedModel;
     const currentModel = this.plugin.settings.ollamaModel;
@@ -904,7 +917,11 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
         progressText.textContent = buildProgressText(count, total, throughput);
         const statsEl = containerEl.querySelector(".index-stats-indexed-count");
         if (statsEl) {
-          statsEl.textContent = `Indexed Notes: ${this.plugin.searchService.vectors.length} / ${total}`;
+          statsEl.textContent = `Indexed Notes: ${count} / ${total}`;
+        }
+        const missingEl = containerEl.querySelector(".index-stats-missing-count");
+        if (missingEl) {
+          missingEl.textContent = `Missing from Index: ${total - count}`;
         }
       };
     } else {

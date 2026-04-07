@@ -10,6 +10,8 @@ export interface NoteVector {
 export class SemanticSearchService {
     public ollamaClient: OllamaClient;
     public vectors: NoteVector[] = [];
+    public isVectorsLoaded: boolean = false;
+    public onVectorsLoaded: (() => void) | null = null;
     private vault: Vault;
     private vectorStorePathJson = normalizePath('.obsidian/plugins/obsidian-related-notes/vectors.json');
     private vectorStorePathBinary = normalizePath('.obsidian/plugins/obsidian-related-notes/vectors.bin');
@@ -54,6 +56,10 @@ export class SemanticSearchService {
         } else {
             if (await this.vault.adapter.exists(this.vectorStorePathJson)) {
                 await this.loadVectorsJson();
+            } else if (await this.vault.adapter.exists(this.vectorStorePathBinary)) {
+                // Fallback: binary file exists even though format is set to json
+                // (can happen if format was switched after indexing)
+                await this.loadVectorsBinary();
             }
         }
 
@@ -65,6 +71,9 @@ export class SemanticSearchService {
         if (pruned > 0) {
             console.log(`Pruned ${pruned} stale vectors at load time`);
         }
+
+        this.isVectorsLoaded = true;
+        if (this.onVectorsLoaded) this.onVectorsLoaded();
     }
 
     async loadVectorsJson() {
