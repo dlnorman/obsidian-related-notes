@@ -6,6 +6,7 @@ import { OllamaConfig, ModelBenchmarkResult } from './ollama_client';
 interface RelatedNotesSettings {
     ollamaUrl: string;
     ollamaModel: string;
+    apiType: 'ollama' | 'openai';
     vectorFormat: 'json' | 'binary';
     lastIndexedDate?: number;
     lastIndexedModel?: string;
@@ -16,6 +17,7 @@ interface RelatedNotesSettings {
 const DEFAULT_SETTINGS: RelatedNotesSettings = {
     ollamaUrl: 'http://localhost:11434',
     ollamaModel: 'nomic-embed-text',
+    apiType: 'ollama',
     vectorFormat: 'json',
     maxRelatedNotes: 5,
     debugMode: false
@@ -30,7 +32,8 @@ export default class RelatedNotesPlugin extends Plugin {
 
         const ollamaConfig: OllamaConfig = {
             baseUrl: this.settings.ollamaUrl,
-            model: this.settings.ollamaModel
+            model: this.settings.ollamaModel,
+            apiType: this.settings.apiType,
         };
         this.searchService = new SemanticSearchService(this.app.vault, ollamaConfig, this.settings.vectorFormat, this.settings.debugMode);
 
@@ -80,9 +83,9 @@ export default class RelatedNotesPlugin extends Plugin {
             callback: async () => {
                 const connected = await this.searchService.testConnection();
                 if (connected) {
-                    new Notice('✓ Connected to Ollama');
+                    new Notice('✓ Connected to embedding server');
                 } else {
-                    new Notice('✗ Failed to connect to Ollama. Make sure Ollama is running.');
+                    new Notice('✗ Failed to connect. Check the Server URL in settings.');
                 }
             }
         });
@@ -305,15 +308,39 @@ class RelatedNotesSettingTab extends PluginSettingTab {
         containerEl.createEl('h2', { text: 'Configuration' });
 
         new Setting(containerEl)
-            .setName('Ollama URL')
-            .setDesc('URL of your Ollama instance (default: http://localhost:11434)')
-            .addText(text => text
-                .setPlaceholder('http://localhost:11434')
-                .setValue(this.plugin.settings.ollamaUrl)
+            .setName('API Backend')
+            .setDesc('Choose your local embedding server. Ollama is the default; select "OpenAI-compatible" for LM Studio or similar servers.')
+            .addDropdown(dropdown => dropdown
+                .addOption('ollama', 'Ollama')
+                .addOption('openai', 'OpenAI-compatible (LM Studio, etc.)')
+                .setValue(this.plugin.settings.apiType)
                 .onChange(async (value) => {
-                    this.plugin.settings.ollamaUrl = value;
+                    this.plugin.settings.apiType = value as 'ollama' | 'openai';
+                    this.plugin.searchService.updateApiType(value as 'ollama' | 'openai');
                     await this.plugin.saveSettings();
+                    this.display();
                 }));
+
+        const isOpenAI = this.plugin.settings.apiType === 'openai';
+        const urlPlaceholder = isOpenAI ? 'http://localhost:1234' : 'http://localhost:11434';
+        const urlDesc = isOpenAI
+            ? 'URL of your OpenAI-compatible server (LM Studio default: http://localhost:1234)'
+            : 'URL of your Ollama instance (default: http://localhost:11434)';
+
+        new Setting(containerEl)
+            .setName('Server URL')
+            .setDesc(urlDesc)
+            .addText(text => {
+                text.setPlaceholder(urlPlaceholder)
+                    .setValue(this.plugin.settings.ollamaUrl)
+                    .onChange(async (value) => {
+                        this.plugin.settings.ollamaUrl = value;
+                        this.plugin.searchService.updateBaseUrl(value);
+                        await this.plugin.saveSettings();
+                    });
+                // Refresh model list once the user finishes typing the URL
+                text.inputEl.addEventListener('blur', () => this.display());
+            });
 
         // Benchmark panel — shown below the model dropdown
         const benchmarkPanel = containerEl.createDiv({ cls: 'model-benchmark-panel' });
@@ -362,7 +389,7 @@ class RelatedNotesSettingTab extends PluginSettingTab {
         let modelDropdown: DropdownComponent | null = null;
         const modelSetting = new Setting(containerEl)
             .setName('Embedding Model')
-            .setDesc('Fetching available models from Ollama...')
+            .setDesc('Fetching available models...')
             .addDropdown(dropdown => {
                 modelDropdown = dropdown;
                 dropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
@@ -380,7 +407,9 @@ class RelatedNotesSettingTab extends PluginSettingTab {
                     if (result.supported && hasIndex && indexedModel && indexedModel !== value) {
                         modelSetting.setDesc(`⚠️ Existing index was built with "${indexedModel}" — you must re-index before results will be valid.`);
                     } else {
-                        modelSetting.setDesc(result.supported ? 'Model supports embeddings. ✓' : '⚠️ Not an embedding model.');
+                        modelSetting.setDesc(result.supported ? 'Model supports embeddings. ✓' : this.plugin.settings.apiType === 'openai'
+                        ? '⚠️ Could not get embeddings from this model. Make sure it is loaded and active in LM Studio\'s server (check the Developer tab). See the browser console for details.'
+                        : '⚠️ Not an embedding model.');
                     }
                 });
             });
@@ -405,14 +434,17 @@ class RelatedNotesSettingTab extends PluginSettingTab {
             renderBenchmark(null, true);
             const result = await this.plugin.searchService.ollamaClient.benchmarkModel();
             renderBenchmark(result, false);
+            const isOpenAIMode = this.plugin.settings.apiType === 'openai';
             modelSetting.setDesc(result.supported
                 ? 'Model supports embeddings. ✓'
                 : models.length === 0
-                    ? 'No models found — make sure Ollama is running at the configured URL.'
-                    : '⚠️ This model does not support embeddings. Choose an embedding model (e.g. nomic-embed-text).');
+                    ? 'No models found — make sure the server is running at the configured URL.'
+                    : isOpenAIMode
+                        ? '⚠️ Could not get embeddings from this model. Make sure it is loaded and active in LM Studio\'s server (check the Developer tab). See the browser console for details.'
+                        : '⚠️ This model does not support embeddings. Choose an embedding model (e.g. nomic-embed-text).');
         }).catch(() => {
             if (!modelDropdown) return;
-            modelSetting.setDesc('Could not fetch models — check the Ollama URL above.');
+            modelSetting.setDesc('Could not fetch models — check the Server URL above.');
             benchmarkPanel.style.display = 'none';
             modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
             modelDropdown.setValue(this.plugin.settings.ollamaModel);
@@ -473,15 +505,15 @@ class RelatedNotesSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Test Connection')
-            .setDesc('Test connection to Ollama')
+            .setDesc('Test connection to the embedding server')
             .addButton(button => button
                 .setButtonText('Test')
                 .onClick(async () => {
                     const connected = await this.plugin.searchService.testConnection();
                     if (connected) {
-                        new Notice('✓ Connected to Ollama');
+                        new Notice('✓ Connected to embedding server');
                     } else {
-                        new Notice('✗ Failed to connect to Ollama');
+                        new Notice('✗ Failed to connect — check Server URL and make sure the server is running');
                     }
                 }));
     }

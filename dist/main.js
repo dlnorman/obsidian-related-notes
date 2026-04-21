@@ -128,11 +128,54 @@ var OllamaClient = class {
   updateModel(model) {
     this.config.model = model;
   }
+  updateApiType(apiType) {
+    this.config.apiType = apiType;
+  }
+  updateBaseUrl(baseUrl) {
+    this.config.baseUrl = baseUrl;
+  }
+  async generateEmbeddingOpenAI(text, retries) {
+    const url = `${this.config.baseUrl}/v1/embeddings`;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      let response;
+      try {
+        response = await (0, import_obsidian2.requestUrl)({
+          url,
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: this.config.model, input: text }),
+          throw: false
+        });
+      } catch (error) {
+        if (attempt < retries) {
+          await new Promise((resolve) => setTimeout(resolve, Math.pow(2, attempt) * 1e3));
+          continue;
+        }
+        throw new Error(`Failed to connect to OpenAI-compatible server: ${error.message}`);
+      }
+      if (response.status !== 200) {
+        if (attempt < retries) {
+          await new Promise((resolve) => setTimeout(resolve, Math.pow(2, attempt) * 1e3));
+          continue;
+        }
+        throw new Error(`OpenAI-compatible API error: ${response.status} - ${response.text}`);
+      }
+      const data = response.json;
+      if (!data.data?.[0]?.embedding || !Array.isArray(data.data[0].embedding)) {
+        throw new Error("Invalid embedding response from OpenAI-compatible API");
+      }
+      return data.data[0].embedding;
+    }
+    throw new Error("Failed to generate embedding after all retries");
+  }
   async generateEmbedding(text, title, retries = 3) {
-    const url = `${this.config.baseUrl}/api/embeddings`;
     const sanitizedText = this.sanitizeText(text);
     const maxLength = 32e3;
     const truncatedText = sanitizedText.length > maxLength ? sanitizedText.substring(0, maxLength) : sanitizedText;
+    if (this.config.apiType === "openai") {
+      return this.generateEmbeddingOpenAI(truncatedText, retries);
+    }
+    const url = `${this.config.baseUrl}/api/embeddings`;
     for (let attempt = 0; attempt <= retries; attempt++) {
       let response;
       try {
@@ -263,24 +306,50 @@ var OllamaClient = class {
     const embeddings = [];
     const start = Date.now();
     for (const sentence of sentences) {
-      const url = `${this.config.baseUrl}/api/embeddings`;
       try {
-        const response = await (0, import_obsidian2.requestUrl)({
-          url,
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: targetModel, prompt: sentence }),
-          throw: false
-        });
-        if (response.status !== 200) {
-          return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+        let embedding;
+        if (this.config.apiType === "openai") {
+          const url = `${this.config.baseUrl}/v1/embeddings`;
+          const response = await (0, import_obsidian2.requestUrl)({
+            url,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: targetModel, input: sentence }),
+            throw: false
+          });
+          if (response.status !== 200) {
+            console.error(`[related-notes] benchmark: HTTP ${response.status} from ${url}`, response.text);
+            return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+          }
+          const data = response.json;
+          if (!data.data?.[0]?.embedding || data.data[0].embedding.length === 0) {
+            console.error("[related-notes] benchmark: unexpected response shape", JSON.stringify(data).slice(0, 300));
+            return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+          }
+          embedding = data.data[0].embedding;
+        } else {
+          const url = `${this.config.baseUrl}/api/embeddings`;
+          const response = await (0, import_obsidian2.requestUrl)({
+            url,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: targetModel, prompt: sentence }),
+            throw: false
+          });
+          if (response.status !== 200) {
+            console.error(`[related-notes] benchmark: HTTP ${response.status} from ${url}`, response.text);
+            return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+          }
+          const data = response.json;
+          if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
+            console.error("[related-notes] benchmark: unexpected response shape", JSON.stringify(data).slice(0, 300));
+            return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+          }
+          embedding = data.embedding;
         }
-        const data = response.json;
-        if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
-          return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
-        }
-        embeddings.push(data.embedding);
-      } catch {
+        embeddings.push(embedding);
+      } catch (error) {
+        console.error("[related-notes] benchmark: request threw", error);
         return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
       }
     }
@@ -321,29 +390,38 @@ var OllamaClient = class {
   }
   async testConnection() {
     try {
-      const url = `${this.config.baseUrl}/api/tags`;
+      const url = this.config.apiType === "openai" ? `${this.config.baseUrl}/v1/models` : `${this.config.baseUrl}/api/tags`;
       const response = await (0, import_obsidian2.requestUrl)({ url, method: "GET" });
       return response.status === 200;
     } catch (error) {
-      console.error("Ollama connection test failed:", error);
+      console.error("Connection test failed:", error);
       return false;
     }
   }
   async listModels() {
     try {
-      const url = `${this.config.baseUrl}/api/tags`;
-      const response = await (0, import_obsidian2.requestUrl)({ url, method: "GET" });
-      if (response.status !== 200)
-        return [];
-      const data = response.json;
-      const models = data.models ?? [];
-      const hasCapabilityInfo = models.some((m) => Array.isArray(m.capabilities));
-      if (hasCapabilityInfo) {
-        return models.filter((m) => m.capabilities?.includes("embedding")).map((m) => m.name);
+      if (this.config.apiType === "openai") {
+        const url = `${this.config.baseUrl}/v1/models`;
+        const response = await (0, import_obsidian2.requestUrl)({ url, method: "GET" });
+        if (response.status !== 200)
+          return [];
+        const data = response.json;
+        return (data.data ?? []).map((m) => m.id);
+      } else {
+        const url = `${this.config.baseUrl}/api/tags`;
+        const response = await (0, import_obsidian2.requestUrl)({ url, method: "GET" });
+        if (response.status !== 200)
+          return [];
+        const data = response.json;
+        const models = data.models ?? [];
+        const hasCapabilityInfo = models.some((m) => Array.isArray(m.capabilities));
+        if (hasCapabilityInfo) {
+          return models.filter((m) => m.capabilities?.includes("embedding")).map((m) => m.name);
+        }
+        return models.map((m) => m.name);
       }
-      return models.map((m) => m.name);
     } catch (error) {
-      console.error("Failed to list Ollama models:", error);
+      console.error("Failed to list models:", error);
       return [];
     }
   }
@@ -383,6 +461,12 @@ var SemanticSearchService = class {
   }
   updateModel(model) {
     this.ollamaClient.updateModel(model);
+  }
+  updateApiType(apiType) {
+    this.ollamaClient.updateApiType(apiType);
+  }
+  updateBaseUrl(baseUrl) {
+    this.ollamaClient.updateBaseUrl(baseUrl);
   }
   async testConnection() {
     return await this.ollamaClient.testConnection();
@@ -710,6 +794,7 @@ var SemanticSearchService = class {
 var DEFAULT_SETTINGS = {
   ollamaUrl: "http://localhost:11434",
   ollamaModel: "nomic-embed-text",
+  apiType: "ollama",
   vectorFormat: "json",
   maxRelatedNotes: 5,
   debugMode: false
@@ -719,7 +804,8 @@ var RelatedNotesPlugin = class extends import_obsidian4.Plugin {
     await this.loadSettings();
     const ollamaConfig = {
       baseUrl: this.settings.ollamaUrl,
-      model: this.settings.ollamaModel
+      model: this.settings.ollamaModel,
+      apiType: this.settings.apiType
     };
     this.searchService = new SemanticSearchService(this.app.vault, ollamaConfig, this.settings.vectorFormat, this.settings.debugMode);
     this.searchService.loadVectors();
@@ -761,9 +847,9 @@ var RelatedNotesPlugin = class extends import_obsidian4.Plugin {
       callback: async () => {
         const connected = await this.searchService.testConnection();
         if (connected) {
-          new import_obsidian4.Notice("\u2713 Connected to Ollama");
+          new import_obsidian4.Notice("\u2713 Connected to embedding server");
         } else {
-          new import_obsidian4.Notice("\u2717 Failed to connect to Ollama. Make sure Ollama is running.");
+          new import_obsidian4.Notice("\u2717 Failed to connect. Check the Server URL in settings.");
         }
       }
     });
@@ -932,10 +1018,23 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
     }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "Configuration" });
-    new import_obsidian4.Setting(containerEl).setName("Ollama URL").setDesc("URL of your Ollama instance (default: http://localhost:11434)").addText((text) => text.setPlaceholder("http://localhost:11434").setValue(this.plugin.settings.ollamaUrl).onChange(async (value) => {
-      this.plugin.settings.ollamaUrl = value;
+    new import_obsidian4.Setting(containerEl).setName("API Backend").setDesc('Choose your local embedding server. Ollama is the default; select "OpenAI-compatible" for LM Studio or similar servers.').addDropdown((dropdown) => dropdown.addOption("ollama", "Ollama").addOption("openai", "OpenAI-compatible (LM Studio, etc.)").setValue(this.plugin.settings.apiType).onChange(async (value) => {
+      this.plugin.settings.apiType = value;
+      this.plugin.searchService.updateApiType(value);
       await this.plugin.saveSettings();
+      this.display();
     }));
+    const isOpenAI = this.plugin.settings.apiType === "openai";
+    const urlPlaceholder = isOpenAI ? "http://localhost:1234" : "http://localhost:11434";
+    const urlDesc = isOpenAI ? "URL of your OpenAI-compatible server (LM Studio default: http://localhost:1234)" : "URL of your Ollama instance (default: http://localhost:11434)";
+    new import_obsidian4.Setting(containerEl).setName("Server URL").setDesc(urlDesc).addText((text) => {
+      text.setPlaceholder(urlPlaceholder).setValue(this.plugin.settings.ollamaUrl).onChange(async (value) => {
+        this.plugin.settings.ollamaUrl = value;
+        this.plugin.searchService.updateBaseUrl(value);
+        await this.plugin.saveSettings();
+      });
+      text.inputEl.addEventListener("blur", () => this.display());
+    });
     const benchmarkPanel = containerEl.createDiv({ cls: "model-benchmark-panel" });
     benchmarkPanel.style.cssText = "margin: 4px 0 16px 0; padding: 10px 12px; background: var(--background-secondary); border-radius: 6px; font-size: 0.85em; display: none;";
     const renderBenchmark = (result, loading) => {
@@ -983,7 +1082,7 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       }
     };
     let modelDropdown = null;
-    const modelSetting = new import_obsidian4.Setting(containerEl).setName("Embedding Model").setDesc("Fetching available models from Ollama...").addDropdown((dropdown) => {
+    const modelSetting = new import_obsidian4.Setting(containerEl).setName("Embedding Model").setDesc("Fetching available models...").addDropdown((dropdown) => {
       modelDropdown = dropdown;
       dropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
       dropdown.setValue(this.plugin.settings.ollamaModel);
@@ -1000,7 +1099,7 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
         if (result.supported && hasIndex && indexedModel2 && indexedModel2 !== value) {
           modelSetting.setDesc(`\u26A0\uFE0F Existing index was built with "${indexedModel2}" \u2014 you must re-index before results will be valid.`);
         } else {
-          modelSetting.setDesc(result.supported ? "Model supports embeddings. \u2713" : "\u26A0\uFE0F Not an embedding model.");
+          modelSetting.setDesc(result.supported ? "Model supports embeddings. \u2713" : this.plugin.settings.apiType === "openai" ? "\u26A0\uFE0F Could not get embeddings from this model. Make sure it is loaded and active in LM Studio's server (check the Developer tab). See the browser console for details." : "\u26A0\uFE0F Not an embedding model.");
         }
       });
     });
@@ -1024,11 +1123,12 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
       renderBenchmark(null, true);
       const result = await this.plugin.searchService.ollamaClient.benchmarkModel();
       renderBenchmark(result, false);
-      modelSetting.setDesc(result.supported ? "Model supports embeddings. \u2713" : models.length === 0 ? "No models found \u2014 make sure Ollama is running at the configured URL." : "\u26A0\uFE0F This model does not support embeddings. Choose an embedding model (e.g. nomic-embed-text).");
+      const isOpenAIMode = this.plugin.settings.apiType === "openai";
+      modelSetting.setDesc(result.supported ? "Model supports embeddings. \u2713" : models.length === 0 ? "No models found \u2014 make sure the server is running at the configured URL." : isOpenAIMode ? "\u26A0\uFE0F Could not get embeddings from this model. Make sure it is loaded and active in LM Studio's server (check the Developer tab). See the browser console for details." : "\u26A0\uFE0F This model does not support embeddings. Choose an embedding model (e.g. nomic-embed-text).");
     }).catch(() => {
       if (!modelDropdown)
         return;
-      modelSetting.setDesc("Could not fetch models \u2014 check the Ollama URL above.");
+      modelSetting.setDesc("Could not fetch models \u2014 check the Server URL above.");
       benchmarkPanel.style.display = "none";
       modelDropdown.addOption(this.plugin.settings.ollamaModel, this.plugin.settings.ollamaModel);
       modelDropdown.setValue(this.plugin.settings.ollamaModel);
@@ -1056,12 +1156,12 @@ var RelatedNotesSettingTab = class extends import_obsidian4.PluginSettingTab {
         this.display();
       }
     }));
-    new import_obsidian4.Setting(containerEl).setName("Test Connection").setDesc("Test connection to Ollama").addButton((button) => button.setButtonText("Test").onClick(async () => {
+    new import_obsidian4.Setting(containerEl).setName("Test Connection").setDesc("Test connection to the embedding server").addButton((button) => button.setButtonText("Test").onClick(async () => {
       const connected = await this.plugin.searchService.testConnection();
       if (connected) {
-        new import_obsidian4.Notice("\u2713 Connected to Ollama");
+        new import_obsidian4.Notice("\u2713 Connected to embedding server");
       } else {
-        new import_obsidian4.Notice("\u2717 Failed to connect to Ollama");
+        new import_obsidian4.Notice("\u2717 Failed to connect \u2014 check Server URL and make sure the server is running");
       }
     }));
   }

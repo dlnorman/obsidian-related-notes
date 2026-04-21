@@ -4,9 +4,14 @@ export interface OllamaEmbeddingResponse {
     embedding: number[];
 }
 
+export interface OpenAIEmbeddingResponse {
+    data: { embedding: number[]; index: number }[];
+}
+
 export interface OllamaConfig {
     baseUrl: string;
     model: string;
+    apiType?: 'ollama' | 'openai';
 }
 
 export interface ModelBenchmarkResult {
@@ -33,15 +38,62 @@ export class OllamaClient {
         this.config.model = model;
     }
 
-    async generateEmbedding(text: string, title?: string, retries: number = 3): Promise<number[]> {
-        const url = `${this.config.baseUrl}/api/embeddings`;
+    updateApiType(apiType: 'ollama' | 'openai') {
+        this.config.apiType = apiType;
+    }
 
+    updateBaseUrl(baseUrl: string) {
+        this.config.baseUrl = baseUrl;
+    }
+
+    private async generateEmbeddingOpenAI(text: string, retries: number): Promise<number[]> {
+        const url = `${this.config.baseUrl}/v1/embeddings`;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            let response;
+            try {
+                response = await requestUrl({
+                    url,
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: this.config.model, input: text }),
+                    throw: false,
+                });
+            } catch (error) {
+                if (attempt < retries) {
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                    continue;
+                }
+                throw new Error(`Failed to connect to OpenAI-compatible server: ${error.message}`);
+            }
+            if (response.status !== 200) {
+                if (attempt < retries) {
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                    continue;
+                }
+                throw new Error(`OpenAI-compatible API error: ${response.status} - ${response.text}`);
+            }
+            const data = response.json as OpenAIEmbeddingResponse;
+            if (!data.data?.[0]?.embedding || !Array.isArray(data.data[0].embedding)) {
+                throw new Error('Invalid embedding response from OpenAI-compatible API');
+            }
+            return data.data[0].embedding;
+        }
+        throw new Error('Failed to generate embedding after all retries');
+    }
+
+    async generateEmbedding(text: string, title?: string, retries: number = 3): Promise<number[]> {
         // Sanitize text to remove null bytes and other non-printable characters
         const sanitizedText = this.sanitizeText(text);
 
         // Truncate text to prevent overly long inputs (max ~8000 tokens ≈ 32000 chars)
         const maxLength = 32000;
         const truncatedText = sanitizedText.length > maxLength ? sanitizedText.substring(0, maxLength) : sanitizedText;
+
+        if (this.config.apiType === 'openai') {
+            return this.generateEmbeddingOpenAI(truncatedText, retries);
+        }
+
+        const url = `${this.config.baseUrl}/api/embeddings`;
 
         for (let attempt = 0; attempt <= retries; attempt++) {
             let response;
@@ -181,24 +233,50 @@ export class OllamaClient {
         const start = Date.now();
 
         for (const sentence of sentences) {
-            const url = `${this.config.baseUrl}/api/embeddings`;
             try {
-                const response = await requestUrl({
-                    url,
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: targetModel, prompt: sentence }),
-                    throw: false,
-                });
-                if (response.status !== 200) {
-                    return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                let embedding: number[];
+                if (this.config.apiType === 'openai') {
+                    const url = `${this.config.baseUrl}/v1/embeddings`;
+                    const response = await requestUrl({
+                        url,
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: targetModel, input: sentence }),
+                        throw: false,
+                    });
+                    if (response.status !== 200) {
+                        console.error(`[related-notes] benchmark: HTTP ${response.status} from ${url}`, response.text);
+                        return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                    }
+                    const data = response.json as OpenAIEmbeddingResponse;
+                    if (!data.data?.[0]?.embedding || data.data[0].embedding.length === 0) {
+                        console.error('[related-notes] benchmark: unexpected response shape', JSON.stringify(data).slice(0, 300));
+                        return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                    }
+                    embedding = data.data[0].embedding;
+                } else {
+                    const url = `${this.config.baseUrl}/api/embeddings`;
+                    const response = await requestUrl({
+                        url,
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: targetModel, prompt: sentence }),
+                        throw: false,
+                    });
+                    if (response.status !== 200) {
+                        console.error(`[related-notes] benchmark: HTTP ${response.status} from ${url}`, response.text);
+                        return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                    }
+                    const data = response.json as OllamaEmbeddingResponse;
+                    if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
+                        console.error('[related-notes] benchmark: unexpected response shape', JSON.stringify(data).slice(0, 300));
+                        return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
+                    }
+                    embedding = data.embedding;
                 }
-                const data = response.json as OllamaEmbeddingResponse;
-                if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
-                    return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
-                }
-                embeddings.push(data.embedding);
-            } catch {
+                embeddings.push(embedding);
+            } catch (error) {
+                console.error('[related-notes] benchmark: request threw', error);
                 return { dimension: 0, msPerEmbed: 0, discriminationScore: 0, supported: false };
             }
         }
@@ -253,33 +331,43 @@ export class OllamaClient {
 
     async testConnection(): Promise<boolean> {
         try {
-            const url = `${this.config.baseUrl}/api/tags`;
+            const url = this.config.apiType === 'openai'
+                ? `${this.config.baseUrl}/v1/models`
+                : `${this.config.baseUrl}/api/tags`;
             const response = await requestUrl({ url, method: 'GET' });
             return response.status === 200;
         } catch (error) {
-            console.error('Ollama connection test failed:', error);
+            console.error('Connection test failed:', error);
             return false;
         }
     }
 
     async listModels(): Promise<string[]> {
         try {
-            const url = `${this.config.baseUrl}/api/tags`;
-            const response = await requestUrl({ url, method: 'GET' });
-            if (response.status !== 200) return [];
-            const data = response.json as { models?: { name: string; capabilities?: string[] }[] };
-            const models = data.models ?? [];
-            // If Ollama returns capability info, filter to embedding-capable models only.
-            // Fall back to all models if capabilities aren't present (older Ollama versions).
-            const hasCapabilityInfo = models.some(m => Array.isArray(m.capabilities));
-            if (hasCapabilityInfo) {
-                return models
-                    .filter(m => m.capabilities?.includes('embedding'))
-                    .map(m => m.name);
+            if (this.config.apiType === 'openai') {
+                const url = `${this.config.baseUrl}/v1/models`;
+                const response = await requestUrl({ url, method: 'GET' });
+                if (response.status !== 200) return [];
+                const data = response.json as { data?: { id: string }[] };
+                return (data.data ?? []).map(m => m.id);
+            } else {
+                const url = `${this.config.baseUrl}/api/tags`;
+                const response = await requestUrl({ url, method: 'GET' });
+                if (response.status !== 200) return [];
+                const data = response.json as { models?: { name: string; capabilities?: string[] }[] };
+                const models = data.models ?? [];
+                // If Ollama returns capability info, filter to embedding-capable models only.
+                // Fall back to all models if capabilities aren't present (older Ollama versions).
+                const hasCapabilityInfo = models.some(m => Array.isArray(m.capabilities));
+                if (hasCapabilityInfo) {
+                    return models
+                        .filter(m => m.capabilities?.includes('embedding'))
+                        .map(m => m.name);
+                }
+                return models.map(m => m.name);
             }
-            return models.map(m => m.name);
         } catch (error) {
-            console.error('Failed to list Ollama models:', error);
+            console.error('Failed to list models:', error);
             return [];
         }
     }

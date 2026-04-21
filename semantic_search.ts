@@ -38,6 +38,14 @@ export class SemanticSearchService {
         this.ollamaClient.updateModel(model);
     }
 
+    updateApiType(apiType: 'ollama' | 'openai') {
+        this.ollamaClient.updateApiType(apiType);
+    }
+
+    updateBaseUrl(baseUrl: string) {
+        this.ollamaClient.updateBaseUrl(baseUrl);
+    }
+
     async testConnection(): Promise<boolean> {
         return await this.ollamaClient.testConnection();
     }
