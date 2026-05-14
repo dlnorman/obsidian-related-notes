@@ -297,10 +297,11 @@ var OllamaClient = class {
   async benchmarkModel(model) {
     const targetModel = model ?? this.config.model;
     const sentences = [
-      "Machine learning models use gradient descent to optimize neural networks.",
-      "Deep learning requires large datasets and significant computational resources.",
+      "Migrating from Blackboard to D2L Brightspace at scale",
+      "LMS data governance and POPA compliance",
+      "Faculty adoption barriers for new learning platforms",
+      "Course-level analytics dashboards in Brightspace",
       "The pasta was perfectly al dente with a rich homemade tomato sauce.",
-      "Saut\xE9ing garlic in olive oil creates a wonderful aromatic base for sauces.",
       "The quarterly earnings report showed a 15% increase in revenue."
     ];
     const embeddings = [];
@@ -366,8 +367,24 @@ var OllamaClient = class {
       const denom = Math.sqrt(normA) * Math.sqrt(normB);
       return denom === 0 ? 0 : dot / denom;
     };
-    const withinTopic = (cosineSim(embeddings[0], embeddings[1]) + cosineSim(embeddings[2], embeddings[3])) / 2;
-    const crossTopic = (cosineSim(embeddings[0], embeddings[2]) + cosineSim(embeddings[0], embeddings[3]) + cosineSim(embeddings[1], embeddings[2]) + cosineSim(embeddings[1], embeddings[3])) / 4;
+    let withinSum = 0;
+    let withinCount = 0;
+    for (let i = 0; i < 4; i++) {
+      for (let j = i + 1; j < 4; j++) {
+        withinSum += cosineSim(embeddings[i], embeddings[j]);
+        withinCount++;
+      }
+    }
+    const withinTopic = withinSum / withinCount;
+    let crossSum = 0;
+    let crossCount = 0;
+    for (let i = 0; i < 4; i++) {
+      for (let j = 4; j < 6; j++) {
+        crossSum += cosineSim(embeddings[i], embeddings[j]);
+        crossCount++;
+      }
+    }
+    const crossTopic = crossSum / crossCount;
     const discriminationScore = withinTopic - crossTopic;
     return { dimension, msPerEmbed, discriminationScore, supported: true };
   }

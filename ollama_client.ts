@@ -218,14 +218,15 @@ export class OllamaClient {
     async benchmarkModel(model?: string): Promise<ModelBenchmarkResult> {
         const targetModel = model ?? this.config.model;
 
-        // Five test sentences: two tech (A), two cooking (B), one finance (C)
-        // A well-discriminating model should cluster A together and B together,
-        // but keep A and B far apart.
+        // Six test sentences: four edu/LMS domain (A0-A3), two off-domain (B0, B1).
+        // Score = avg(within-domain pairs) − avg(edu vs off-domain pairs).
+        // Tests both intra-domain clustering AND cross-domain separation.
         const sentences = [
-            'Machine learning models use gradient descent to optimize neural networks.',
-            'Deep learning requires large datasets and significant computational resources.',
+            'Migrating from Blackboard to D2L Brightspace at scale',
+            'LMS data governance and POPA compliance',
+            'Faculty adoption barriers for new learning platforms',
+            'Course-level analytics dashboards in Brightspace',
             'The pasta was perfectly al dente with a rich homemade tomato sauce.',
-            'Sautéing garlic in olive oil creates a wonderful aromatic base for sauces.',
             'The quarterly earnings report showed a 15% increase in revenue.',
         ];
 
@@ -297,15 +298,27 @@ export class OllamaClient {
             return denom === 0 ? 0 : dot / denom;
         };
 
-        // Within-topic similarity: (A0,A1) and (B0,B1)
-        const withinTopic = (cosineSim(embeddings[0], embeddings[1]) + cosineSim(embeddings[2], embeddings[3])) / 2;
-        // Cross-topic similarity: A vs B pairs
-        const crossTopic = (
-            cosineSim(embeddings[0], embeddings[2]) +
-            cosineSim(embeddings[0], embeddings[3]) +
-            cosineSim(embeddings[1], embeddings[2]) +
-            cosineSim(embeddings[1], embeddings[3])
-        ) / 4;
+        // Within-domain: all 6 pairs among edu samples [0..3]
+        let withinSum = 0;
+        let withinCount = 0;
+        for (let i = 0; i < 4; i++) {
+            for (let j = i + 1; j < 4; j++) {
+                withinSum += cosineSim(embeddings[i], embeddings[j]);
+                withinCount++;
+            }
+        }
+        const withinTopic = withinSum / withinCount;
+
+        // Cross-domain: each edu sample vs each off-domain sample (4 × 2 = 8 pairs)
+        let crossSum = 0;
+        let crossCount = 0;
+        for (let i = 0; i < 4; i++) {
+            for (let j = 4; j < 6; j++) {
+                crossSum += cosineSim(embeddings[i], embeddings[j]);
+                crossCount++;
+            }
+        }
+        const crossTopic = crossSum / crossCount;
 
         const discriminationScore = withinTopic - crossTopic;
 
